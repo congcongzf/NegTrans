@@ -412,6 +412,28 @@ public enum FilmProfiles {
     }
 }
 
+    /// Crop interleaved RGBA pixels to a unit rect. Returns (pixels, w, h).
+    public static func cropPixels(_ pixels: [Float], width: Int, height: Int,
+                                  rect: CGRect) -> ([Float], Int, Int) {
+        let x0 = max(0, min(width - 1, Int(rect.minX * CGFloat(width))))
+        let y0 = max(0, min(height - 1, Int(rect.minY * CGFloat(height))))
+        let x1 = max(x0 + 1, min(width, Int(rect.maxX * CGFloat(width))))
+        let y1 = max(y0 + 1, min(height, Int(rect.maxY * CGFloat(height))))
+        let w = x1 - x0, h = y1 - y0
+        var out = [Float](repeating: 0, count: w * h * 4)
+        for y in 0..<h {
+            for x in 0..<w {
+                let src = ((y0 + y) * width + (x0 + x)) * 4
+                let dst = (y * w + x) * 4
+                out[dst] = pixels[src]
+                out[dst + 1] = pixels[src + 1]
+                out[dst + 2] = pixels[src + 2]
+                out[dst + 3] = pixels[src + 3]
+            }
+        }
+        return (out, w, h)
+    }
+
 // MARK: - Output
 
     /// Linear RGB (0...1) -> sRGB (0...1), per-pixel.
