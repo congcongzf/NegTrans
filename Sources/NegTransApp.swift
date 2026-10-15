@@ -31,6 +31,7 @@ struct ContentView: View {
     @StateObject private var model = NegModel()
     @State private var showBatch = false
     @State private var cropping = false
+    @State private var healing = false
 
     var body: some View {
         NavigationSplitView {
@@ -55,6 +56,16 @@ struct ContentView: View {
                     .disabled(!model.hasImage)
                     if model.cropRect != nil {
                         Button("清除裁切") { model.cropRect = nil }
+                    }
+                    Button(healing ? "完成修复" : "灰尘修复…") {
+                        if healing { healing = false }
+                        else if model.hasImage { healing = true }
+                    }
+                    .disabled(!model.hasImage)
+                    if !model.healSpots.isEmpty {
+                        Button("清除修复点 (\(model.healSpots.count))") {
+                            model.healSpots.removeAll()
+                        }
                     }
 
                     Slider(value: $model.params.densityGamma, in: 0.5...2.0, step: 0.01) {
@@ -82,6 +93,10 @@ struct ContentView: View {
                     Slider(value: gainBinding(2), in: -1.0...1.0, step: 0.001) {
                         Text("B 增益")
                     }
+                }
+
+                Section("曲线") {
+                    CurvesEditor(curves: $model.params.curves)
                 }
 
                 Section("输出") {
@@ -114,7 +129,14 @@ struct ContentView: View {
                     imagePanel(title: "底片", image: model.inputImage)
                 }
                 Divider()
-                imagePanel(title: "正片", image: model.outputImage)
+                if healing, let img = model.outputImage {
+                    HealEditor(image: img, spots: $model.healSpots,
+                               radius: $model.healRadius) {
+                        healing = false
+                    }
+                } else {
+                    imagePanel(title: "正片", image: model.outputImage)
+                }
             }
         }
         .onChange(of: model.params.densityGamma) { _, _ in model.render() }
@@ -123,7 +145,10 @@ struct ContentView: View {
         .onChange(of: model.params.rgbGains.1) { _, _ in model.render() }
         .onChange(of: model.params.rgbGains.2) { _, _ in model.render() }
         .onChange(of: model.params.screenGlare) { _, _ in model.render() }
+        .onChange(of: model.params.curves) { _, _ in model.render() }
         .onChange(of: model.cropRect) { _, _ in model.autoAdjust() }
+        .onChange(of: model.healSpots) { _, _ in model.render() }
+        .onChange(of: model.healRadius) { _, _ in model.render() }
         .sheet(isPresented: $showBatch) {
             BatchView(model: model)
                 .frame(minWidth: 560, minHeight: 420)
@@ -190,6 +215,9 @@ final class NegModel: ObservableObject {
     @Published var selectedProfile: FilmProfile = FilmProfiles.all[0]
     /// Crop rect in unit coordinates (0-1), nil = full frame.
     @Published var cropRect: CGRect?
+    /// Dust heal spots in unit coordinates.
+    @Published var healSpots: [CGPoint] = []
+    @Published var healRadius: Float = 4
 
     /// Working context renders in linear sRGB, so the float bitmap
     /// we get out is linear light — exactly what the pipeline expects.
@@ -270,19 +298,32 @@ final class NegModel: ObservableObject {
         }
         let wbNow = wb
         let paramsNow = params
+        let healSpotsNow = healSpots
+        let healRadiusNow = healRadius
         renderQueue.async { [weak self] in
             var wbPixels = pixels
             NegPipeline.applyWB(&wbPixels, wb: wbNow)
             let out = NegPipeline.process(pixels: wbPixels,
                                           width: w, height: h,
                                           params: paramsNow)
-            // sRGB encode for display
+            // sRGB encode for display, then per-channel curves
             var bytes = [UInt8](repeating: 0, count: w * h * 4)
+            let curvesNow = paramsNow.curves
             for i in 0..<(w * h) {
-                bytes[i * 4]     = UInt8(NegPipeline.srgbEncode(out[i * 4]) * 255)
-                bytes[i * 4 + 1] = UInt8(NegPipeline.srgbEncode(out[i * 4 + 1]) * 255)
-                bytes[i * 4 + 2] = UInt8(NegPipeline.srgbEncode(out[i * 4 + 2]) * 255)
+                var r = NegPipeline.srgbEncode(out[i * 4])
+                var g = NegPipeline.srgbEncode(out[i * 4 + 1])
+                var b = NegPipeline.srgbEncode(out[i * 4 + 2])
+                (r, g, b) = NegPipeline.applyCurves(r: r, g: g, b: b, curves: curvesNow)
+                bytes[i * 4]     = UInt8(min(1, max(0, r)) * 255)
+                bytes[i * 4 + 1] = UInt8(min(1, max(0, g)) * 255)
+                bytes[i * 4 + 2] = UInt8(min(1, max(0, b)) * 255)
                 bytes[i * 4 + 3] = 255
+            }
+            // dust healing
+            if !healSpotsNow.isEmpty {
+                NegPipeline.healSpots(&bytes, width: w, height: h,
+                                      spots: healSpotsNow,
+                                      radius: Int(healRadiusNow))
             }
             guard let provider = CGDataProvider(data: Data(bytes) as CFData),
                   let cg = CGImage(width: w, height: h,
@@ -445,12 +486,16 @@ final class NegModel: ObservableObject {
                                              gamma: pp.densityGamma, wb: (1, 1, 1))
         let out = NegPipeline.process(pixels: pixels, width: w, height: h, params: pp)
 
-        // 16-bit TIFF
+        // 16-bit TIFF (sRGB + curves)
         var u16 = [UInt16](repeating: 0, count: w * h * 4)
         for i in 0..<(w * h) {
-            u16[i*4]   = UInt16(NegPipeline.srgbEncode(out[i*4]) * 65535)
-            u16[i*4+1] = UInt16(NegPipeline.srgbEncode(out[i*4+1]) * 65535)
-            u16[i*4+2] = UInt16(NegPipeline.srgbEncode(out[i*4+2]) * 65535)
+            var r = NegPipeline.srgbEncode(out[i*4])
+            var g = NegPipeline.srgbEncode(out[i*4+1])
+            var b = NegPipeline.srgbEncode(out[i*4+2])
+            (r, g, b) = NegPipeline.applyCurves(r: r, g: g, b: b, curves: pp.curves)
+            u16[i*4]   = UInt16(min(1, max(0, r)) * 65535)
+            u16[i*4+1] = UInt16(min(1, max(0, g)) * 65535)
+            u16[i*4+2] = UInt16(min(1, max(0, b)) * 65535)
             u16[i*4+3] = 65535
         }
         let provider = CGDataProvider(data: Data(bytes: u16,
@@ -481,6 +526,172 @@ enum BatchError: Error, LocalizedError {
         case .decodeFailed(let n): return "解码失败: \(n)"
         case .encodeFailed(let n): return "编码失败: \(n)"
         }
+    }
+}
+
+// MARK: - Curves editor
+
+struct CurvesEditor: View {
+    @Binding var curves: [[Float]]  // 3 x 5
+    @State private var channel = 0  // 0=R, 1=G, 2=B, 3=All
+    private let channelNames = ["R", "G", "B", "全部"]
+    private let channelColors: [Color] = [.red, .green, .blue, .white]
+
+    var body: some View {
+        VStack(spacing: 6) {
+            HStack {
+                ForEach(0..<4) { i in
+                    Button(channelNames[i]) { channel = i }
+                        .buttonStyle(.bordered)
+                        .tint(channel == i ? channelColors[i] : nil)
+                }
+                Spacer()
+                Button("重置") { reset() }
+                    .font(.caption)
+            }
+            .font(.caption)
+
+            GeometryReader { geo in
+                let size = geo.size
+                ZStack {
+                    // grid
+                    Path { p in
+                        for i in 0...4 {
+                            let x = size.width * CGFloat(i) / 4
+                            p.move(to: CGPoint(x: x, y: 0))
+                            p.addLine(to: CGPoint(x: x, y: size.height))
+                            let y = size.height * CGFloat(i) / 4
+                            p.move(to: CGPoint(x: 0, y: y))
+                            p.addLine(to: CGPoint(x: size.width, y: y))
+                        }
+                    }
+                    .stroke(Color.gray.opacity(0.3), lineWidth: 0.5)
+                    // curves
+                    ForEach(0..<3) { c in
+                        if channel == 3 || channel == c {
+                            curvePath(c, size: size)
+                                .stroke(channelColors[c], lineWidth: channel == c ? 2 : 1)
+                        }
+                    }
+                    // points
+                    ForEach(0..<5) { i in
+                        if channel < 3 {
+                            let x = size.width * CGFloat(i) / 4
+                            let y = size.height * (1 - CGFloat(curves[channel][i]))
+                            Circle()
+                                .fill(channelColors[channel])
+                                .frame(width: 10, height: 10)
+                                .position(x: x, y: y)
+                                .gesture(
+                                    DragGesture()
+                                        .onChanged { v in
+                                            let yVal = 1 - Float(v.location.y / size.height)
+                                            setPoint(channel: channel, index: i,
+                                                     value: min(1, max(0, yVal)))
+                                        }
+                                )
+                        }
+                    }
+                }
+                .contentShape(Rectangle())
+            }
+            .frame(height: 160)
+            .background(Color.black.opacity(0.2))
+            .cornerRadius(4)
+        }
+        .padding(8)
+    }
+
+    private func curvePath(_ c: Int, size: CGSize) -> Path {
+        var path = Path()
+        let pts = curves[c]
+        for i in 0..<5 {
+            let x = size.width * CGFloat(i) / 4
+            let y = size.height * (1 - CGFloat(pts[i]))
+            if i == 0 { path.move(to: CGPoint(x: x, y: y)) }
+            else { path.addLine(to: CGPoint(x: x, y: y)) }
+        }
+        return path
+    }
+
+    private func setPoint(channel: Int, index: Int, value: Float) {
+        if channel == 3 {
+            for c in 0..<3 { curves[c][index] = value }
+        } else {
+            curves[channel][index] = value
+        }
+    }
+
+    private func reset() {
+        curves = [[0, 0.25, 0.5, 0.75, 1],
+                  [0, 0.25, 0.5, 0.75, 1],
+                  [0, 0.25, 0.5, 0.75, 1]]
+    }
+}
+
+// MARK: - Heal editor
+
+struct HealEditor: View {
+    let image: NSImage
+    @Binding var spots: [CGPoint]  // unit coords
+    @Binding var radius: Float
+    var onDone: () -> Void
+
+    var body: some View {
+        VStack(spacing: 6) {
+            Text("灰尘修复").font(.headline)
+            Text("点击灰尘点进行修复")
+                .font(.caption).foregroundStyle(.secondary)
+            HStack {
+                Text("半径")
+                    .font(.caption)
+                Slider(value: $radius, in: 2...20, step: 1)
+                    .frame(width: 120)
+                Text("\(Int(radius))")
+                    .font(.caption)
+                    .frame(width: 24)
+                Spacer()
+                Button("清除全部") { spots.removeAll() }
+                    .font(.caption)
+                Button("完成", action: onDone)
+                    .font(.caption)
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(.horizontal, 8)
+
+            GeometryReader { geo in
+                let imgSize = image.size
+                let scale = min(geo.size.width / imgSize.width,
+                                geo.size.height / imgSize.height)
+                let dw = imgSize.width * scale, dh = imgSize.height * scale
+                let ox = (geo.size.width - dw) / 2, oy = (geo.size.height - dh) / 2
+
+                ZStack {
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: geo.size.width, height: geo.size.height)
+                    // spots
+                    ForEach(spots.indices, id: \.self) { i in
+                        let s = spots[i]
+                        Circle()
+                            .stroke(Color.red, lineWidth: 1.5)
+                            .frame(width: CGFloat(radius) * 2 * scale,
+                                   height: CGFloat(radius) * 2 * scale)
+                            .position(x: ox + s.x * dw, y: oy + s.y * dh)
+                    }
+                }
+                .contentShape(Rectangle())
+                .onTapGesture { loc in
+                    let ux = (loc.x - ox) / dw
+                    let uy = (loc.y - oy) / dh
+                    if ux >= 0 && ux <= 1 && uy >= 0 && uy <= 1 {
+                        spots.append(CGPoint(x: ux, y: uy))
+                    }
+                }
+            }
+        }
+        .padding(8)
     }
 }
 
