@@ -351,63 +351,51 @@ public struct FilmProfile: Identifiable, Hashable {
     public let name: String
     public var gamma: Float
     public var dmaxOffset: Float
-    /// 3x3 matrix replacing the default (row-major), or nil to keep default.
-    public var matrix: (Float, Float, Float,
-                       Float, Float, Float,
-                       Float, Float, Float)?
+    /// Saturation multiplier (1.0 = neutral).
+    public var saturation: Float
+    /// Warmth shift (-1 cool … +1 warm), applied as R/B gain.
+    public var warmth: Float
 
     public init(id: String, name: String, gamma: Float = 1.0,
-                dmaxOffset: Float = 0,
-                matrix: (Float, Float, Float,
-                         Float, Float, Float,
-                         Float, Float, Float)? = nil) {
+                dmaxOffset: Float = 0, saturation: Float = 1.0,
+                warmth: Float = 0) {
         self.id = id; self.name = name
         self.gamma = gamma; self.dmaxOffset = dmaxOffset
-        self.matrix = matrix
+        self.saturation = saturation; self.warmth = warmth
     }
-
-    public static func == (lhs: FilmProfile, rhs: FilmProfile) -> Bool { lhs.id == rhs.id }
-    public func hash(into h: inout Hasher) { h.combine(id) }
 }
 
 public enum FilmProfiles {
     public static let all: [FilmProfile] = [
         FilmProfile(id: "neutral", name: "中性"),
-        FilmProfile(id: "pro400h", name: "Fuji PRO 400H",
-                    gamma: 1.0, dmaxOffset: 0),  // our calibrated reference
+        FilmProfile(id: "pro400h", name: "Fuji PRO 400H"),
         FilmProfile(id: "portra400", name: "Kodak Portra 400",
-                    gamma: 0.95, dmaxOffset: 0.1,
-                    matrix: (1.03, 0.02, 0.00,
-                             0.01, 0.92, 0.04,
-                             0.00, 0.02, 0.99)),  // warm, soft
+                    gamma: 0.95, dmaxOffset: 0.1, saturation: 0.92, warmth: 0.15),
         FilmProfile(id: "portra160", name: "Kodak Portra 160",
-                    gamma: 0.92, dmaxOffset: 0.15,
-                    matrix: (1.02, 0.02, 0.00,
-                             0.01, 0.94, 0.03,
-                             0.00, 0.01, 1.00)),
+                    gamma: 0.92, dmaxOffset: 0.15, saturation: 0.9, warmth: 0.12),
         FilmProfile(id: "ektar", name: "Kodak Ektar 100",
-                    gamma: 1.12, dmaxOffset: -0.1,
-                    matrix: (1.08, -0.02, -0.01,
-                             -0.02, 0.98, -0.01,
-                             -0.01, -0.03, 1.06)),  // vivid, contrasty
+                    gamma: 1.12, dmaxOffset: -0.1, saturation: 1.25, warmth: 0.05),
         FilmProfile(id: "gold200", name: "Kodak Gold 200",
-                    gamma: 1.02, dmaxOffset: 0.05,
-                    matrix: (1.06, 0.03, -0.02,
-                             0.02, 0.95, 0.02,
-                             -0.01, 0.00, 1.02)),  // warm consumer
+                    gamma: 1.02, dmaxOffset: 0.05, saturation: 1.1, warmth: 0.2),
         FilmProfile(id: "cinestill800t", name: "Cinestill 800T",
-                    gamma: 1.05, dmaxOffset: 0,
-                    matrix: (1.00, 0.04, 0.02,
-                             0.02, 0.96, 0.05,
-                             0.03, 0.03, 1.02)),  // cool tungsten
+                    gamma: 1.05, saturation: 1.05, warmth: -0.15),
     ]
 
+    /// Build a 3x3 matrix from saturation/warmth around the default matrix.
     public static func apply(_ profile: FilmProfile, to params: inout NegParameters) {
         params.densityGamma = profile.gamma
-        if let m = profile.matrix {
-            params.matrix = m
-            params.useMatrix = true
-        }
+        // start from the calibrated default matrix
+        var m = (1.0197 as Float, 0.0317 as Float, 0.0091 as Float,
+                 -0.0052 as Float, 0.8933 as Float, 0.0521 as Float,
+                 0.0131 as Float, -0.0011 as Float, 0.9712 as Float)
+        // saturation: scale off-diagonals
+        let s = profile.saturation
+        m.1 *= s; m.2 *= s; m.3 *= s; m.5 *= s; m.6 *= s; m.7 *= s
+        // warmth: R gain up, B gain down (or reverse)
+        let w = profile.warmth
+        m.0 *= (1 + w * 0.1); m.8 *= (1 - w * 0.1)
+        params.matrix = m
+        params.useMatrix = true
         // note: dmaxOffset is applied by the caller on top of auto dmax
     }
 }
