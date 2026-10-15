@@ -26,6 +26,7 @@ struct NegTransApp: App {
 struct ContentView: View {
     @StateObject private var model = NegModel()
     @State private var showBatch = false
+    @State private var cropping = false
 
     var body: some View {
         NavigationSplitView {
@@ -43,6 +44,14 @@ struct ContentView: View {
 
                     Button("自动调整") { model.autoAdjust() }
                         .disabled(!model.hasImage)
+                    Button(cropping ? "完成裁切" : "裁切…") {
+                        if cropping { cropping = false }
+                        else if model.hasImage { cropping = true }
+                    }
+                    .disabled(!model.hasImage)
+                    if model.cropRect != nil {
+                        Button("清除裁切") { model.cropRect = nil }
+                    }
 
                     Slider(value: $model.params.densityGamma, in: 0.5...2.0, step: 0.01) {
                         Text("反差 (gamma)")
@@ -93,7 +102,13 @@ struct ContentView: View {
         } detail: {
             // Detail: before / after
             HStack(spacing: 0) {
-                imagePanel(title: "底片", image: model.inputImage)
+                if cropping, let img = model.inputImage {
+                    CropEditor(image: img, rect: $model.cropRect) {
+                        cropping = false
+                    }
+                } else {
+                    imagePanel(title: "底片", image: model.inputImage)
+                }
                 Divider()
                 imagePanel(title: "正片", image: model.outputImage)
             }
@@ -104,6 +119,7 @@ struct ContentView: View {
         .onChange(of: model.params.rgbGains.1) { _, _ in model.render() }
         .onChange(of: model.params.rgbGains.2) { _, _ in model.render() }
         .onChange(of: model.params.screenGlare) { _, _ in model.render() }
+        .onChange(of: model.cropRect) { _, _ in model.autoAdjust() }
         .sheet(isPresented: $showBatch) {
             BatchView(model: model)
                 .frame(minWidth: 560, minHeight: 420)
@@ -168,6 +184,8 @@ final class NegModel: ObservableObject {
 
     var hasImage: Bool { !linearPixels.isEmpty }
     @Published var selectedProfile: FilmProfile = FilmProfiles.all[0]
+    /// Crop rect in unit coordinates (0-1), nil = full frame.
+    @Published var cropRect: CGRect?
 
     /// Working context renders in linear sRGB, so the float bitmap
     /// we get out is linear light — exactly what the pipeline expects.
@@ -240,8 +258,12 @@ final class NegModel: ObservableObject {
         guard !linearPixels.isEmpty else { return }
         renderTicket += 1
         let ticket = renderTicket
-        let pixels = linearPixels
-        let w = width, h = height
+        var pixels = linearPixels
+        var w = width, h = height
+        if let cr = cropRect {
+            let (cp, cw, ch) = NegPipeline.cropPixels(pixels, width: w, height: h, rect: cr)
+            pixels = cp; w = cw; h = ch
+        }
         let wbNow = wb
         let paramsNow = params
         renderQueue.async { [weak self] in
@@ -318,8 +340,15 @@ final class NegModel: ObservableObject {
         }
         wb = wbNow
 
-        // 3. automatic dmax from the white-balanced densities.
-        autoDMaxValue = NegPipeline.autoDMax(pixels: linearPixels, width: width, height: height,
+        // 3. automatic dmax from the white-balanced densities
+        //    (on the cropped area if a crop is set).
+        var dmaxPixels = linearPixels
+        var dw = width, dh = height
+        if let cr = cropRect {
+            let (cp, cw, ch) = NegPipeline.cropPixels(linearPixels, width: width, height: height, rect: cr)
+            dmaxPixels = cp; dw = cw; dh = ch
+        }
+        autoDMaxValue = NegPipeline.autoDMax(pixels: dmaxPixels, width: dw, height: dh,
                                              gamma: params.densityGamma, wb: wbNow)
         applyProfile(selectedProfile, keepDMax: true)
         render()
@@ -473,6 +502,137 @@ struct HistogramView: View {
                 path.closeSubpath()
                 ctx.fill(path, with: .color(colors[c].opacity(0.45)))
             }
+        }
+    }
+}
+
+// MARK: - Crop editor
+
+struct CropEditor: View {
+    let image: NSImage
+    @Binding var rect: CGRect?  // unit 0-1, nil = full
+    var onDone: () -> Void
+
+    @State private var aspect: CGFloat? = nil
+    @State private var dragStart: CGPoint? = nil
+    @State private var dragCurrent: CGPoint? = nil
+
+    private let aspects: [(String, CGFloat?)] = [
+        ("自由", nil), ("3:2", 1.5), ("4:3", 4/3), ("1:1", 1), ("6:7", 6/7), ("4:5", 0.8),
+    ]
+
+    var body: some View {
+        VStack(spacing: 6) {
+            Text("裁切").font(.headline)
+            HStack {
+                ForEach(aspects, id: \.0) { name, a in
+                    Button(name) { aspect = a }
+                        .buttonStyle(.bordered)
+                        .tint(aspect == a ? .accentColor : nil)
+                }
+                Spacer()
+                Button("重置") { rect = nil }
+                Button("完成", action: onDone).keyboardShortcut(.defaultAction)
+            }
+            .font(.caption)
+            .padding(.horizontal, 8)
+
+            GeometryReader { geo in
+                let imgSize = image.size
+                // fit image into geo
+                let scale = min(geo.size.width / imgSize.width,
+                                geo.size.height / imgSize.height)
+                let dw = imgSize.width * scale, dh = imgSize.height * scale
+                let ox = (geo.size.width - dw) / 2, oy = (geo.size.height - dh) / 2
+
+                ZStack {
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: geo.size.width, height: geo.size.height)
+                    // dim outside
+                    CropDimView(rect: currentRect(geo: geo, ox: ox, oy: oy, dw: dw, dh: dh),
+                                full: CGRect(x: ox, y: oy, width: dw, height: dh))
+                    // rect outline
+                    if let r = currentRect(geo: geo, ox: ox, oy: oy, dw: dw, dh: dh) {
+                        Rectangle()
+                            .stroke(Color.accentColor, lineWidth: 2)
+                            .frame(width: r.width, height: r.height)
+                            .position(x: r.midX, y: r.midY)
+                    }
+                }
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 2)
+                        .onChanged { v in
+                            if dragStart == nil { dragStart = v.startLocation }
+                            dragCurrent = v.location
+                        }
+                        .onEnded { v in
+                            if let s = dragStart {
+                                let r = makeRect(from: s, to: v.location,
+                                                 ox: ox, oy: oy, dw: dw, dh: dh)
+                                rect = r
+                            }
+                            dragStart = nil; dragCurrent = nil
+                        }
+                )
+            }
+        }
+        .padding(8)
+    }
+
+    private func currentRect(geo: GeometryProxy, ox: CGFloat, oy: CGFloat,
+                             dw: CGFloat, dh: CGFloat) -> CGRect? {
+        if let s = dragStart, let c = dragCurrent {
+            let r = makeRect(from: s, to: c, ox: ox, oy: oy, dw: dw, dh: dh)
+            return CGRect(x: ox + r.minX * dw, y: oy + r.minY * dh,
+                          width: r.width * dw, height: r.height * dh)
+        }
+        if let r = rect {
+            return CGRect(x: ox + r.minX * dw, y: oy + r.minY * dh,
+                          width: r.width * dw, height: r.height * dh)
+        }
+        return nil
+    }
+
+    private func makeRect(from s: CGPoint, to e: CGPoint,
+                          ox: CGFloat, oy: CGFloat, dw: CGFloat, dh: CGFloat) -> CGRect {
+        // to unit coords, clamped to image
+        var x0 = min(max((s.x - ox) / dw, 0), 1)
+        var y0 = min(max((s.y - oy) / dh, 0), 1)
+        var x1 = min(max((e.x - ox) / dw, 0), 1)
+        var y1 = min(max((e.y - oy) / dh, 0), 1)
+        if let a = aspect {
+            // constrain by width, adjust height
+            var w = abs(x1 - x0)
+            var h = w / a
+            if h > 1 { h = 1; w = h * a }
+            x1 = x0 + (e.x >= s.x ? w : -w)
+            y1 = y0 + (e.y >= s.y ? h : -h)
+            x0 = min(max(x0, 0), 1); x1 = min(max(x1, 0), 1)
+            y0 = min(max(y0, 0), 1); y1 = min(max(y1, 0), 1)
+        }
+        return CGRect(x: min(x0, x1), y: min(y0, y1),
+                      width: abs(x1 - x0), height: abs(y1 - y0))
+    }
+}
+
+struct CropDimView: View {
+    let rect: CGRect?  // in view coords, nil = no dim
+    let full: CGRect
+    var body: some View {
+        Canvas { ctx, size in
+            guard let r = rect else { return }
+            // draw 4 dim rects around r
+            ctx.fill(Path(CGRect(x: 0, y: 0, width: size.width, height: r.minY)),
+                     with: .color(.black.opacity(0.55)))
+            ctx.fill(Path(CGRect(x: 0, y: r.maxY, width: size.width, height: size.height - r.maxY)),
+                     with: .color(.black.opacity(0.55)))
+            ctx.fill(Path(CGRect(x: 0, y: r.minY, width: r.minX, height: r.height)),
+                     with: .color(.black.opacity(0.55)))
+            ctx.fill(Path(CGRect(x: r.maxX, y: r.minY, width: size.width - r.maxX, height: r.height)),
+                     with: .color(.black.opacity(0.55)))
         }
     }
 }
