@@ -8,6 +8,10 @@ import AppKit
 import CoreImage
 import UniformTypeIdentifiers
 
+// FilmProfile/FilmProfiles are nested in NegPipeline; alias for convenience.
+typealias FilmProfile = NegPipeline.FilmProfile
+typealias FilmProfiles = NegPipeline.FilmProfiles
+
 @main
 struct NegTransApp: App {
     var body: some Scene {
