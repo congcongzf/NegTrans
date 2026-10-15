@@ -47,7 +47,7 @@ public struct NegParameters {
     /// x = 0, 0.25, 0.5, 0.75, 1.0). Applied in display space.
     public var curves: [[Float]] = [[0, 0.25, 0.5, 0.75, 1] as [Float],
                                    [0, 0.25, 0.5, 0.75, 1] as [Float],
-                                   [0, 0.25, 0.5, 0.75, 1] as [Float]].0
+                                   [0, 0.25, 0.5, 0.75, 1] as [Float]]
 
     public init() {}
 }
