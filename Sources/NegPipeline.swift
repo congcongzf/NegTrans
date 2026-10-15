@@ -45,9 +45,9 @@ public struct NegParameters {
     public var screenGlare: Float = 0
     /// Per-channel curves: 3 channels x 5 control points (y values at
     /// x = 0, 0.25, 0.5, 0.75, 1.0). Applied in display space.
-    public var curves: [[Float]] = [[0, 0.25, 0.5, 0.75, 1],
-                                   [0, 0.25, 0.5, 0.75, 1],
-                                   [0, 0.25, 0.5, 0.75, 1]].0
+    public var curves: [[Float]] = [[0, 0.25, 0.5, 0.75, 1] as [Float],
+                                   [0, 0.25, 0.5, 0.75, 1] as [Float],
+                                   [0, 0.25, 0.5, 0.75, 1] as [Float]].0
 
     public init() {}
 }
