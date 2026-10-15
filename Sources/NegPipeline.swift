@@ -141,7 +141,7 @@ public enum NegPipeline {
         // density = -log10(max(c, 1e-10))
         var tmp = [Float](repeating: 0, count: n)
         vDSP.clip(c, to: 1e-10...Float.greatestFiniteMagnitude, result: &tmp)
-        vDSP_vlog10(tmp, 1, &tmp, 1, vDSP_Length(n))
+        vForce.log10(tmp, result: &tmp)
         vDSP.multiply(-1, tmp, result: &tmp)
         // adjusted = pivot + (density - pivot) * gamma - dmax
         var adj = [Float](repeating: 0, count: n)
@@ -150,14 +150,14 @@ public enum NegPipeline {
         vDSP.add(pivotInv - dmax, adj, result: &adj)
         // linear = exp(adjusted * ln10)
         vDSP.multiply(ln10, adj, result: &adj)
-        vDSP.exp(adj, result: &c)
+        vForce.exp(adj, result: &c)
     }
 
     private static func toDensity(_ c: inout [Float]) {
         let n = c.count
         var tmp = [Float](repeating: 0, count: n)
         vDSP.clip(c, to: 1e-10...Float.greatestFiniteMagnitude, result: &tmp)
-        vDSP_vlog10(tmp, 1, &tmp, 1, vDSP_Length(n))
+        vForce.log10(tmp, result: &tmp)
         vDSP.multiply(-1, tmp, result: &c)
     }
 
@@ -165,7 +165,7 @@ public enum NegPipeline {
         let n = c.count
         var tmp = [Float](repeating: 0, count: n)
         vDSP.multiply(-ln10, c, result: &tmp)
-        vDSP.exp(tmp, result: &tmp)
+        vForce.exp(tmp, result: &tmp)
         vDSP.clip(tmp, to: 0...1, result: &c)
     }
 
