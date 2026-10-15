@@ -341,7 +341,78 @@ public enum NegPipeline {
         return base.0 / base.2 > 2.0
     }
 
-    // MARK: - Output
+    // MARK: - Film profiles
+
+/// Named starting points based on the known look of common color negative
+/// films. Each profile tweaks contrast (gamma), saturation (matrix) and
+/// color balance around the neutral conversion. Fine-tune with sliders.
+public struct FilmProfile: Identifiable, Hashable {
+    public let id: String
+    public let name: String
+    public var gamma: Float
+    public var dmaxOffset: Float
+    /// 3x3 matrix replacing the default (row-major), or nil to keep default.
+    public var matrix: (Float, Float, Float,
+                       Float, Float, Float,
+                       Float, Float, Float)?
+
+    public init(id: String, name: String, gamma: Float = 1.0,
+                dmaxOffset: Float = 0,
+                matrix: (Float, Float, Float,
+                         Float, Float, Float,
+                         Float, Float, Float)? = nil) {
+        self.id = id; self.name = name
+        self.gamma = gamma; self.dmaxOffset = dmaxOffset
+        self.matrix = matrix
+    }
+
+    public static func == (lhs: FilmProfile, rhs: FilmProfile) -> Bool { lhs.id == rhs.id }
+    public func hash(into h: inout Hasher) { h.combine(id) }
+}
+
+public enum FilmProfiles {
+    public static let all: [FilmProfile] = [
+        FilmProfile(id: "neutral", name: "中性"),
+        FilmProfile(id: "pro400h", name: "Fuji PRO 400H",
+                    gamma: 1.0, dmaxOffset: 0),  // our calibrated reference
+        FilmProfile(id: "portra400", name: "Kodak Portra 400",
+                    gamma: 0.95, dmaxOffset: 0.1,
+                    matrix: (1.03, 0.02, 0.00,
+                             0.01, 0.92, 0.04,
+                             0.00, 0.02, 0.99)),  // warm, soft
+        FilmProfile(id: "portra160", name: "Kodak Portra 160",
+                    gamma: 0.92, dmaxOffset: 0.15,
+                    matrix: (1.02, 0.02, 0.00,
+                             0.01, 0.94, 0.03,
+                             0.00, 0.01, 1.00)),
+        FilmProfile(id: "ektar", name: "Kodak Ektar 100",
+                    gamma: 1.12, dmaxOffset: -0.1,
+                    matrix: (1.08, -0.02, -0.01,
+                             -0.02, 0.98, -0.01,
+                             -0.01, -0.03, 1.06)),  // vivid, contrasty
+        FilmProfile(id: "gold200", name: "Kodak Gold 200",
+                    gamma: 1.02, dmaxOffset: 0.05,
+                    matrix: (1.06, 0.03, -0.02,
+                             0.02, 0.95, 0.02,
+                             -0.01, 0.00, 1.02)),  // warm consumer
+        FilmProfile(id: "cinestill800t", name: "Cinestill 800T",
+                    gamma: 1.05, dmaxOffset: 0,
+                    matrix: (1.00, 0.04, 0.02,
+                             0.02, 0.96, 0.05,
+                             0.03, 0.03, 1.02)),  // cool tungsten
+    ]
+
+    public static func apply(_ profile: FilmProfile, to params: inout NegParameters) {
+        params.densityGamma = profile.gamma
+        if let m = profile.matrix {
+            params.matrix = m
+            params.useMatrix = true
+        }
+        // note: dmaxOffset is applied by the caller on top of auto dmax
+    }
+}
+
+// MARK: - Output
 
     /// Linear RGB (0...1) -> sRGB (0...1), per-pixel.
     public static func srgbEncode(_ linear: Float) -> Float {
