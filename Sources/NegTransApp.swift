@@ -25,12 +25,22 @@ struct NegTransApp: App {
 
 struct ContentView: View {
     @StateObject private var model = NegModel()
+    @State private var showBatch = false
 
     var body: some View {
         NavigationSplitView {
             // Sidebar: controls
             Form {
                 Section("底片反转") {
+                    Picker("胶片", selection: $model.selectedProfile) {
+                        ForEach(FilmProfiles.all) { profile in
+                            Text(profile.name).tag(profile)
+                        }
+                    }
+                    .onChange(of: model.selectedProfile) { _, new in
+                        model.applyProfile(new)
+                    }
+
                     Button("自动调整") { model.autoAdjust() }
                         .disabled(!model.hasImage)
 
@@ -62,11 +72,15 @@ struct ContentView: View {
                 }
 
                 Section("输出") {
+                    HistogramView(histogram: model.histogram)
+                        .frame(height: 80)
+
                     Slider(value: $model.params.screenGlare, in: 0...5, step: 0.1) {
                         Text("眩光补偿 %")
                     }
                     Button("导出 TIFF") { model.export() }
                         .disabled(model.outputImage == nil)
+                    Button("批量处理…") { showBatch = true }
                 }
             }
             .formStyle(.grouped)
@@ -90,6 +104,10 @@ struct ContentView: View {
         .onChange(of: model.params.rgbGains.1) { _, _ in model.render() }
         .onChange(of: model.params.rgbGains.2) { _, _ in model.render() }
         .onChange(of: model.params.screenGlare) { _, _ in model.render() }
+        .sheet(isPresented: $showBatch) {
+            BatchView(model: model)
+                .frame(minWidth: 560, minHeight: 420)
+        }
     }
 
     private func gainBinding(_ ch: Int) -> Binding<Float> {
@@ -140,13 +158,16 @@ final class NegModel: ObservableObject {
     @Published var params = NegParameters()
     @Published var inputImage: NSImage?
     @Published var outputImage: NSImage?
+    @Published var histogram: [[Float]] = [[], [], []]
 
     private var linearPixels: [Float] = []
     private var width = 0
     private var height = 0
     private var wb: (Float, Float, Float) = (1, 1, 1)
+    private var autoDMaxValue: Float = 2.2
 
     var hasImage: Bool { !linearPixels.isEmpty }
+    @Published var selectedProfile: FilmProfile = FilmProfiles.all[0]
 
     /// Working context renders in linear sRGB, so the float bitmap
     /// we get out is linear light — exactly what the pipeline expects.
@@ -246,9 +267,19 @@ final class NegModel: ObservableObject {
                                    provider: provider, decode: nil,
                                    shouldInterpolate: false, intent: .defaultIntent) else { return }
             let img = NSImage(cgImage: cg, size: .zero)
+            // histogram from display bytes
+            var hist = [[Float]](repeating: [Float](repeating: 0, count: 256), count: 3)
+            for i in 0..<(w * h) {
+                hist[0][Int(bytes[i*4])] += 1
+                hist[1][Int(bytes[i*4+1])] += 1
+                hist[2][Int(bytes[i*4+2])] += 1
+            }
+            let peak = max(hist[0].max() ?? 1, hist[1].max() ?? 1, hist[2].max() ?? 1)
+            for c in 0..<3 { for b in 0..<256 { hist[c][b] /= peak } }
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.renderTicket == ticket else { return }
                 self.outputImage = img
+                self.histogram = hist
             }
         }
     }
@@ -288,8 +319,24 @@ final class NegModel: ObservableObject {
         wb = wbNow
 
         // 3. automatic dmax from the white-balanced densities.
-        params.densityDMax = NegPipeline.autoDMax(pixels: linearPixels, width: width, height: height,
-                                                  gamma: params.densityGamma, wb: wbNow)
+        autoDMaxValue = NegPipeline.autoDMax(pixels: linearPixels, width: width, height: height,
+                                             gamma: params.densityGamma, wb: wbNow)
+        applyProfile(selectedProfile, keepDMax: true)
+        render()
+    }
+
+    func applyProfile(_ profile: FilmProfile, keepDMax: Bool = false) {
+        selectedProfile = profile
+        let baseDMax = keepDMax ? autoDMaxValue : params.densityDMax
+        // reset to neutral, then apply profile deltas (no accumulation)
+        params.densityGamma = 1.0
+        params.useMatrix = true
+        params.matrix = (1.0197, 0.0317, 0.0091,
+                         -0.0052, 0.8933, 0.0521,
+                         0.0131, -0.0011, 0.9712)
+        FilmProfiles.apply(profile, to: &params)
+        // profile dmax is an offset on top of auto
+        params.densityDMax = baseDMax + profile.dmaxOffset
         render()
     }
 
@@ -300,8 +347,232 @@ final class NegModel: ObservableObject {
               let data = rep.representation(using: .tiff, properties: [:]) else { return }
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.tiff]
-        panel.nameFieldStringValue = "negclone-output.tiff"
+        panel.nameFieldStringValue = "negtrans-output.tiff"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         try? data.write(to: url)
+    }
+
+    // MARK: - Batch
+
+    /// Convert a single file with current settings (auto WB + auto dmax +
+    /// selected profile) and write a 16-bit TIFF to the output folder.
+    /// Runs synchronously; call off the main thread.
+    func convertFile(_ url: URL, to outputDir: URL) throws {
+        // decode
+        let ci: CIImage
+        if let rawFilter = CIFilter(imageURL: url, options: nil),
+           let rawOut = rawFilter.outputImage {
+            rawFilter.setValue(0, forKey: "inputEnableSharpening")
+            rawFilter.setValue(0, forKey: "inputEnableNoiseTracking")
+            rawFilter.setValue(0, forKey: "inputEnableVendorLensCorrection")
+            ci = rawOut
+        } else {
+            guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+                  let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+                throw BatchError.decodeFailed(url.lastPathComponent)
+            }
+            ci = CIImage(cgImage: cg)
+        }
+        let w = Int(ci.extent.width), h = Int(ci.extent.height)
+        guard w > 0, h > 0 else { throw BatchError.decodeFailed(url.lastPathComponent) }
+        var pixels = [Float](repeating: 0, count: w * h * 4)
+        ciContext.render(ci, toBitmap: &pixels,
+                         rowBytes: w * 4 * MemoryLayout<Float>.size,
+                         bounds: CGRect(x: 0, y: 0, width: w, height: h),
+                         format: .RGBAf,
+                         colorSpace: CGColorSpace(name: CGColorSpace.linearSRGB))
+
+        // auto WB
+        var wbNow: (Float, Float, Float) = (1, 1, 1)
+        let base = NegPipeline.sampleFilmBase(pixels: pixels, width: w, height: h,
+                                              region: (w/40, w/15, h/3, 2*h/3))
+        if NegPipeline.looksLikeFilmBase(base) {
+            wbNow = NegPipeline.baseWBMultipliers(base: base)
+            let s = max(1, w / 600)
+            let sw = w / s, sh = h / s
+            var small = [Float](repeating: 0, count: sw * sh * 4)
+            for y in 0..<sh {
+                for x in 0..<sw {
+                    let src = ((y * s) * w + x * s) * 4
+                    let dst = (y * sw + x) * 4
+                    small[dst] = pixels[src] * wbNow.0
+                    small[dst + 1] = pixels[src + 1] * wbNow.1
+                    small[dst + 2] = pixels[src + 2] * wbNow.2
+                    small[dst + 3] = 1
+                }
+            }
+            let first = NegPipeline.process(pixels: small, width: sw, height: sh, params: params)
+            wbNow = NegPipeline.refineWB(positive: first, wb: wbNow)
+        }
+
+        // convert (pixels already WB'd, so dmax uses identity wb)
+        NegPipeline.applyWB(&pixels, wb: wbNow)
+        var pp = params
+        pp.densityDMax = NegPipeline.autoDMax(pixels: pixels, width: w, height: h,
+                                             gamma: pp.densityGamma, wb: (1, 1, 1))
+        let out = NegPipeline.process(pixels: pixels, width: w, height: h, params: pp)
+
+        // 16-bit TIFF
+        var u16 = [UInt16](repeating: 0, count: w * h * 4)
+        for i in 0..<(w * h) {
+            u16[i*4]   = UInt16(NegPipeline.srgbEncode(out[i*4]) * 65535)
+            u16[i*4+1] = UInt16(NegPipeline.srgbEncode(out[i*4+1]) * 65535)
+            u16[i*4+2] = UInt16(NegPipeline.srgbEncode(out[i*4+2]) * 65535)
+            u16[i*4+3] = 65535
+        }
+        let provider = CGDataProvider(data: Data(bytes: u16,
+                                                 count: u16.count * 2) as CFData)!
+        guard let cg = CGImage(width: w, height: h,
+                               bitsPerComponent: 16, bitsPerPixel: 64,
+                               bytesPerRow: w * 8,
+                               space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                               bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
+                               provider: provider, decode: nil,
+                               shouldInterpolate: false, intent: .defaultIntent) else {
+            throw BatchError.encodeFailed(url.lastPathComponent)
+        }
+        let rep = NSBitmapImageRep(cgImage: cg)
+        guard let tiff = rep.representation(using: .tiff, properties: [:]) else {
+            throw BatchError.encodeFailed(url.lastPathComponent)
+        }
+        let outName = url.deletingPathExtension().lastPathComponent + "_negtrans.tiff"
+        try tiff.write(to: outputDir.appendingPathComponent(outName))
+    }
+}
+
+enum BatchError: Error, LocalizedError {
+    case decodeFailed(String)
+    case encodeFailed(String)
+    var errorDescription: String? {
+        switch self {
+        case .decodeFailed(let n): return "解码失败: \(n)"
+        case .encodeFailed(let n): return "编码失败: \(n)"
+        }
+    }
+}
+
+// MARK: - Histogram
+
+struct HistogramView: View {
+    let histogram: [[Float]]  // 3 x 256, normalized
+    private let colors: [Color] = [.red, .green, .blue]
+
+    var body: some View {
+        Canvas { ctx, size in
+            guard histogram.count == 3, !histogram[0].isEmpty else { return }
+            let w = size.width / 256
+            for c in 0..<3 {
+                var path = Path()
+                path.move(to: CGPoint(x: 0, y: size.height))
+                for b in 0..<256 {
+                    let x = CGFloat(b) * w
+                    let y = size.height - CGFloat(histogram[c][b]) * size.height
+                    path.addLine(to: CGPoint(x: x, y: y))
+                }
+                path.addLine(to: CGPoint(x: size.width, y: size.height))
+                path.closeSubpath()
+                ctx.fill(path, with: .color(colors[c].opacity(0.45)))
+            }
+        }
+    }
+}
+
+// MARK: - Batch UI
+
+struct BatchItem: Identifiable {
+    let id = UUID()
+    let url: URL
+    var status: String = "等待"
+}
+
+struct BatchView: View {
+    @ObservedObject var model: NegModel
+    @State private var items: [BatchItem] = []
+    @State private var outputDir: URL?
+    @State private var running = false
+    @State private var progress: Double = 0
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Text("批量处理").font(.headline)
+            Text("使用当前胶片预设与参数自动转换（自动白平衡 + 自动 dmax），输出 16-bit TIFF。")
+                .font(.caption).foregroundStyle(.secondary)
+
+            HStack {
+                Button("添加文件…") { pickFiles() }
+                Button("选择输出文件夹…") { pickOutput() }
+                Spacer()
+                if let dir = outputDir {
+                    Text(dir.lastPathComponent).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+
+            List(items) { item in
+                HStack {
+                    Text(item.url.lastPathComponent).font(.caption)
+                    Spacer()
+                    Text(item.status).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+
+            if running {
+                ProgressView(value: progress, total: 1)
+            }
+
+            HStack {
+                Spacer()
+                Button("关闭") { dismiss() }.disabled(running)
+                Button("开始转换") { run() }
+                    .disabled(running || items.isEmpty || outputDir == nil)
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding()
+    }
+
+    private func pickFiles() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.tiff, .png, .jpeg, .rawImage]
+        panel.allowsMultipleSelection = true
+        guard panel.runModal() == .OK else { return }
+        for url in panel.urls where !items.contains(where: { $0.url == url }) {
+            items.append(BatchItem(url: url))
+        }
+    }
+
+    private func pickOutput() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        outputDir = url
+    }
+
+    private func run() {
+        guard let outDir = outputDir, !running else { return }
+        running = true
+        progress = 0
+        let params = model.params
+        DispatchQueue.global(qos: .userInitiated).async {
+            // snapshot settings on a scratch model so UI stays interactive
+            let worker = NegModel()
+            worker.params = params
+            for idx in items.indices {
+                let url = items[idx].url
+                DispatchQueue.main.async { items[idx].status = "处理中…" }
+                do {
+                    try worker.convertFile(url, to: outDir)
+                    DispatchQueue.main.async { items[idx].status = "完成" }
+                } catch {
+                    DispatchQueue.main.async { items[idx].status = "失败" }
+                }
+                DispatchQueue.main.async {
+                    progress = Double(idx + 1) / Double(items.count)
+                }
+            }
+            DispatchQueue.main.async { running = false }
+        }
     }
 }
