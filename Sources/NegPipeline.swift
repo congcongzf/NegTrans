@@ -42,7 +42,12 @@ public struct NegParameters {
     public var curveRGB: [(Float, Float)]? = nil
 
     /// Screen glare compensation in percent (0 ... 5).
-    public var screenGlare: Float = 0.0
+    public var screenGlare: Float = 0
+    /// Per-channel curves: 3 channels x 5 control points (y values at
+    /// x = 0, 0.25, 0.5, 0.75, 1.0). Applied in display space.
+    public var curves: [[Float]] = [[0, 0.25, 0.5, 0.75, 1],
+                                   [0, 0.25, 0.5, 0.75, 1],
+                                   [0, 0.25, 0.5, 0.75, 1]].0
 
     public init() {}
 }
@@ -420,6 +425,62 @@ public enum FilmProfiles {
             }
         }
         return (out, w, h)
+    }
+
+    /// Evaluate a 5-point curve (y values at x = 0, .25, .5, .75, 1) at t.
+    public static func evalCurve(_ points: [Float], t: Float) -> Float {
+        let tc = min(1, max(0, t))
+        let seg = min(3, Int(tc * 4))
+        let f = tc * 4 - Float(seg)
+        return points[seg] * (1 - f) + points[seg + 1] * f
+    }
+
+    /// Apply per-channel curves in display (sRGB) space.
+    public static func applyCurves(r: Float, g: Float, b: Float,
+                                   curves: [[Float]]) -> (Float, Float, Float) {
+        return (evalCurve(curves[0], t: r),
+                evalCurve(curves[1], t: g),
+                evalCurve(curves[2], t: b))
+    }
+
+    /// Simple dust healing: for each spot, replace a small disc with the
+    /// median of the surrounding annulus. Operates on 8-bit RGBA bytes.
+    public static func healSpots(_ bytes: inout [UInt8], width: Int, height: Int,
+                                 spots: [CGPoint], radius: Int) {
+        guard radius > 0, !spots.isEmpty else { return }
+        for spot in spots {
+            let cx = Int(spot.x * CGFloat(width))
+            let cy = Int(spot.y * CGFloat(height))
+            // collect annulus pixels (radius*2 to radius*3)
+            var samplesR: [UInt8] = [], samplesG: [UInt8] = [], samplesB: [UInt8] = []
+            let r2 = radius * 2, r3 = radius * 3
+            for dy in -r3...r3 {
+                for dx in -r3...r3 {
+                    let d2 = dx*dx + dy*dy
+                    if d2 < r2*r2 || d2 > r3*r3 { continue }
+                    let x = cx + dx, y = cy + dy
+                    if x < 0 || x >= width || y < 0 || y >= height { continue }
+                    let idx = (y * width + x) * 4
+                    samplesR.append(bytes[idx])
+                    samplesG.append(bytes[idx+1])
+                    samplesB.append(bytes[idx+2])
+                }
+            }
+            guard !samplesR.isEmpty else { continue }
+            samplesR.sort(); samplesG.sort(); samplesB.sort()
+            let med = samplesR.count / 2
+            let mr = samplesR[med], mg = samplesG[med], mb = samplesB[med]
+            // fill disc
+            for dy in -radius...radius {
+                for dx in -radius...radius {
+                    if dx*dx + dy*dy > radius*radius { continue }
+                    let x = cx + dx, y = cy + dy
+                    if x < 0 || x >= width || y < 0 || y >= height { continue }
+                    let idx = (y * width + x) * 4
+                    bytes[idx] = mr; bytes[idx+1] = mg; bytes[idx+2] = mb
+                }
+            }
+        }
     }
 
 // MARK: - Output
