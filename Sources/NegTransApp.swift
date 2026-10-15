@@ -623,9 +623,9 @@ struct CurvesEditor: View {
     }
 
     private func reset() {
-        curves = [[0, 0.25, 0.5, 0.75, 1],
-                  [0, 0.25, 0.5, 0.75, 1],
-                  [0, 0.25, 0.5, 0.75, 1]]
+        curves = [[0, 0.25, 0.5, 0.75, 1] as [Float],
+                  [0, 0.25, 0.5, 0.75, 1] as [Float],
+                  [0, 0.25, 0.5, 0.75, 1] as [Float]]
     }
 }
 
